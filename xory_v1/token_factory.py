@@ -16,14 +16,14 @@ from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 from sklearn.ensemble import RandomForestClassifier
 import warnings
+
+# Import for Telegram bot functionality
+import asyncio
+from telegram import Bot
+from telegram.error import TelegramError
+
 # ------------------------- Global Settings -------------------------
-
-
-
-# Suppress XGBoost warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
-
-# ------------------------- Global Settings -------------------------
 engine = create_engine("postgresql://postgres:Rw.1010419@localhost:5432/watchlist")
 VERBOSE = False  # Set to True for detailed per-token logs
 
@@ -31,6 +31,9 @@ VERBOSE = False  # Set to True for detailed per-token logs
 init_complete = False
 init_message = ""
 init_progress = 0.0  # Value between 0 and 1
+
+# Global dictionary to persist agents per token.
+persistent_agents = {}
 
 # ------------------------- Helper Function -------------------------
 def is_complete_token(entry):
@@ -276,8 +279,6 @@ class DataMining:
         self.post_seed_wait()  # 3-minute wait post-seeding
         self.clock_function()
 
-# ------------------------- End Aggregation Code -------------------------
-
 # ------------------------- Global Shared Objects -------------------------
 class GlobalKnowledge:
     def __init__(self):
@@ -427,8 +428,18 @@ class XGBoostAgent(TradingAgent):
 def process_token(token_address: str, config: TradingConfig):
     """
     Continuously processes a token (rebidding after each trading round).
-    Displays minimal output (using token symbols) while updating global state.
+    Uses persistent agent instances so that each token's agents learn over time.
     """
+    global persistent_agents
+    # Create persistent agents for this token if they don't exist.
+    if token_address not in persistent_agents:
+        persistent_agents[token_address] = {
+            'rf': ReverseForestAgent(config),
+            'rl': RLAgent(config, num_bins=10),
+            'xgb': XGBoostAgent(config)
+        }
+    agents = persistent_agents[token_address]
+
     while True:
         try:
             query = f"""
@@ -439,7 +450,8 @@ def process_token(token_address: str, config: TradingConfig):
                    liquidity_quote, fdv, marketcap, paircreatedat,
                    imageurl, websites, socials, boosts_active, timestamp
             FROM watchlist
-            WHERE basetoken_address = '{token_address}' OR quotetoken_address = '{token_address}';
+            WHERE basetoken_address = '{token_address}' OR quotetoken_address = '{token_address}'
+            ORDER BY timestamp ASC;
             """
             df = pd.read_sql(query, engine)
             df.columns = df.columns.str.lower()
@@ -471,31 +483,30 @@ def process_token(token_address: str, config: TradingConfig):
         latest_sample = X.iloc[[-1]]
         latest_price = latest_sample['priceusd'].values[0]
 
-        rf_agent = ReverseForestAgent(config)
-        rf_agent.train(X, y)
-        rl_agent = RLAgent(config, num_bins=10)
-        rl_agent.train(X['priceusd'], price_change)
-        xgb_agent = XGBoostAgent(config)
-        xgb_agent.train(X, y)
+        # Train persistent agents using current data.
+        agents['rf'].train(X, y)
+        agents['rl'].train(X['priceusd'], price_change)
+        agents['xgb'].train(X, y)
 
-        rf_action, rf_confidence = rf_agent.predict(latest_sample)
-        rl_action, rl_confidence = rl_agent.predict(latest_price)
-        xgb_action, xgb_confidence = xgb_agent.predict(latest_sample)
+        rf_action, rf_confidence = agents['rf'].predict(latest_sample)
+        rl_action, rl_confidence = agents['rl'].predict(latest_price)
+        xgb_action, xgb_confidence = agents['xgb'].predict(latest_sample)
         token_symbol = df['basetoken_symbol'].iloc[0] if 'basetoken_symbol' in df.columns else token_address
 
-        # Update global knowledge with minimal info for dashboard aggregation
+        # Update global knowledge BEFORE simulated trade.
         instance_results = {
-            'rf': {'action': rf_action, 'confidence': rf_confidence, 'weight': rf_agent.weight_score},
-            'rl': {'action': rl_action, 'confidence': rl_confidence, 'weight': rl_agent.weight_score},
-            'xgb': {'action': xgb_action, 'confidence': xgb_confidence, 'weight': xgb_agent.weight_score},
+            'rf': {'action': rf_action, 'confidence': rf_confidence, 'weight': agents['rf'].weight_score},
+            'rl': {'action': rl_action, 'confidence': rl_confidence, 'weight': agents['rl'].weight_score},
+            'xgb': {'action': xgb_action, 'confidence': xgb_confidence, 'weight': agents['xgb'].weight_score},
             'token_symbol': token_symbol
         }
         global_knowledge.update(token_address, instance_results)
 
         if VERBOSE:
             print(f"[{token_symbol}] Recs: RF={rf_action}({rf_confidence:.2f}), RL={rl_action}({rl_confidence:.2f}), XGB={xgb_action}({xgb_confidence:.2f})")
-            print(f"[{token_symbol}] Consensus: {max(set([rf_action, rl_action, xgb_action]), key=[rf_action, rl_action, xgb_action].count)}")
-            print(f"[{token_symbol}] Weights: RF={rf_agent.weight_score:.2f}, RL={rl_agent.weight_score:.2f}, XGB={xgb_agent.weight_score:.2f}")
+            consensus = max(set([rf_action, rl_action, xgb_action]), key=[rf_action, rl_action, xgb_action].count)
+            print(f"[{token_symbol}] Consensus: {consensus}")
+            print(f"[{token_symbol}] Weights: RF={agents['rf'].weight_score:.2f}, RL={agents['rl'].weight_score:.2f}, XGB={agents['xgb'].weight_score:.2f}")
             print(f"[{token_symbol}] Entering bidding phase for {config.bidding_duration} seconds.")
 
         time.sleep(config.bidding_duration)
@@ -522,12 +533,21 @@ def process_token(token_address: str, config: TradingConfig):
         else:
             reward_multiplier = 1.0
             punishment_multiplier = 1 + (config.holding_duration * config.negative_trade_multiplier_rate)
-        rf_agent.update_reward(rf_action, simulated_profit, rf_confidence, reward_multiplier, punishment_multiplier)
-        rl_agent.update_reward(rl_action, simulated_profit, rl_confidence, reward_multiplier, punishment_multiplier)
-        xgb_agent.update_reward(xgb_action, simulated_profit, xgb_confidence, reward_multiplier, punishment_multiplier)
-        if VERBOSE:
-            print(f"[{token_symbol}] Final Weights: RF={rf_agent.weight_score:.2f}, RL={rl_agent.weight_score:.2f}, XGB={xgb_agent.weight_score:.2f}")
-            print(f"[{token_symbol}] Round complete.\n")
+        
+        # Update agent rewards based on simulated trade outcome.
+        agents['rf'].update_reward(rf_action, simulated_profit, rf_confidence, reward_multiplier, punishment_multiplier)
+        agents['rl'].update_reward(rl_action, simulated_profit, rl_confidence, reward_multiplier, punishment_multiplier)
+        agents['xgb'].update_reward(xgb_action, simulated_profit, xgb_confidence, reward_multiplier, punishment_multiplier)
+        
+        # Update global knowledge AFTER reward adjustments.
+        instance_results = {
+            'rf': {'action': rf_action, 'confidence': rf_confidence, 'weight': agents['rf'].weight_score},
+            'rl': {'action': rl_action, 'confidence': rl_confidence, 'weight': agents['rl'].weight_score},
+            'xgb': {'action': xgb_action, 'confidence': xgb_confidence, 'weight': agents['xgb'].weight_score},
+            'token_symbol': token_symbol
+        }
+        global_knowledge.update(token_address, instance_results)
+        
         time.sleep(2)
 
 # ------------------------- Signal Interface -------------------------
@@ -578,32 +598,17 @@ class Signal:
         output += "-------------------------------\n"
         return output
     def run(self):
+        # Auto-refresh the dashboard every 'signal_refresh_interval' seconds.
         while True:
-            # Clear screen and move cursor to top-left
             sys.stdout.write("\033[2J\033[H")
             dashboard = ""
             dashboard += self.display_agent_weights()
             dashboard += self.display_latest_signals()
             dashboard += "\n---- Options ----\n"
-            dashboard += "P - Latest trade profit/loss outcomes\n"
-            dashboard += "C - Current active trades\n"
-            dashboard += "Q - Quit\n"
+            dashboard += "Press Ctrl+C to quit.\n"
             sys.stdout.write(dashboard)
             sys.stdout.flush()
-            user_input = input("Enter option (or press ENTER to refresh): ").strip().lower()
-            if user_input == 'p':
-                sys.stdout.write("\033[2J\033[H")
-                sys.stdout.write(self.display_trade_outcomes())
-                input("Press ENTER to continue...")
-            elif user_input == 'c':
-                sys.stdout.write("\033[2J\033[H")
-                sys.stdout.write(self.display_active_trades())
-                input("Press ENTER to continue...")
-            elif user_input == 'q':
-                print("Exiting Signal interface.")
-                break
-            else:
-                time.sleep(self.config.signal_refresh_interval)
+            time.sleep(self.config.signal_refresh_interval)
 
 # ------------------------- TokenLists Class -------------------------
 class TokenLists:
@@ -639,13 +644,84 @@ def display_initialization():
     sys.stdout.write("\nInitialization complete. Launching dashboard...\n")
     sys.stdout.flush()
 
+# ------------------------- Telegram Bot Class -------------------------
+class TelegramBot:
+    def __init__(self, token, chat_id, global_knowledge, poll_interval=30):
+        """
+        Initializes the Telegram bot.
+
+        Parameters:
+            token (str): The Telegram bot token.
+            chat_id (str or int): The Telegram group chat ID where messages will be sent.
+            global_knowledge (GlobalKnowledge): A reference to the global knowledge instance containing agent signals.
+            poll_interval (int, optional): How often (in seconds) to send updates.
+        """
+        self.token = token
+        self.chat_id = chat_id
+        self.global_knowledge = global_knowledge
+        self.poll_interval = poll_interval
+        self.bot = Bot(token=self.token)
+        self.running = False
+
+    def construct_message(self):
+        """
+        Constructs the message text to send to the Telegram group chat based on the latest agent signals.
+        Returns:
+            str: A formatted message string.
+        """
+        data = self.global_knowledge.get_all()
+        if not data:
+            return "No agent signals available."
+        message_lines = ["*Agent Signals Update:*"]
+        for token, info in data.items():
+            token_symbol = info.get("token_symbol", token)
+            votes = [
+                info["rf"]["action"],
+                info["rl"]["action"],
+                info["xgb"]["action"]
+            ]
+            consensus = max(set(votes), key=votes.count)
+            message_lines.append(f"Token: {token_symbol} -> Consensus: {consensus.upper()}")
+        return "\n".join(message_lines)
+
+    def relay_signals(self):
+        """
+        Periodically sends the constructed signal message to the specified Telegram group chat.
+        This method creates its own event loop to await the asynchronous send_message call.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        while self.running:
+            message = self.construct_message()
+            try:
+                loop.run_until_complete(self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode="Markdown"))
+            except TelegramError as e:
+                print(f"Error sending message: {e}")
+            time.sleep(self.poll_interval)
+
+    def start(self):
+        """
+        Starts the Telegram bot's signal relay in a separate daemon thread.
+        """
+        self.running = True
+        self.thread = threading.Thread(target=self.relay_signals, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """
+        Stops the signal relay and waits for the thread to finish.
+        """
+        self.running = False
+        if hasattr(self, 'thread') and self.thread.is_alive():
+            self.thread.join()
+
 # ------------------------- Main Execution -------------------------
 def main():
     global init_complete
     aggregator = DataMining(source="API")
     aggregator_thread = threading.Thread(target=aggregator.run, daemon=True)
     aggregator_thread.start()
-    print("Aggregator thread started. Waiting 10 minutes for seeding to complete...")
+    print("Aggregator thread started. Waiting 3 minutes for seeding to complete...")
     display_initialization()
     final_database_check(required_rows=1, poll_interval=10)
     
@@ -654,7 +730,7 @@ def main():
         reward_value=0.05,
         punishment_value=0.05,
         bidding_duration=5,
-        holding_duration=10,
+        holding_duration=60,
         positive_trade_multiplier_rate=0.1,
         negative_trade_multiplier_rate=0.1,
         signal_refresh_interval=30
@@ -669,15 +745,19 @@ def main():
     all_tokens = list(set(latest + most_active))
     all_tokens = all_tokens[:20]  # Limit to 20 tokens
     
-    print("Starting processing for tokens:")
-    for t in all_tokens:
-        print("  ", t)
+    print("Starting processing for tokens")
     
     executor = ThreadPoolExecutor(max_workers=min(len(all_tokens), 20))
     for token in all_tokens:
         executor.submit(process_token, token, config)
     
-    # Immediately launch the Signal dashboard (main thread)
+    # Instantiate and start the Telegram bot BEFORE launching the Signal dashboard.
+    TELEGRAM_BOT_TOKEN = "7937809727:AAF84eC3iKCwhYvbFeaU-TJTp3H6RQqr45Y"
+    TELEGRAM_CHAT_ID = "-1002338904119"  # Make sure this is the correct chat ID.
+    telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, global_knowledge, poll_interval=30)
+    telegram_bot.start()
+    
+    # Now launch the Signal dashboard (this call is blocking).
     signal = Signal(config)
     signal.run()
 
