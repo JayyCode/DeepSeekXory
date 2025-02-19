@@ -1,3 +1,4 @@
+import os
 import requests
 import time
 from datetime import datetime
@@ -8,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import sys
 import sklearn
+import queue  # For thread-safe command communication
 
 # Import SQLAlchemy components
 from sqlalchemy import create_engine, text
@@ -22,6 +24,11 @@ import asyncio
 from telegram import Bot
 from telegram.error import TelegramError
 
+# Import PyTorch for the centralized critic
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
 # ------------------------- Global Settings -------------------------
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 engine = create_engine("postgresql://postgres:Rw.1010419@localhost:5432/watchlist")
@@ -32,10 +39,14 @@ init_complete = False
 init_message = ""
 init_progress = 0.0  # Value between 0 and 1
 
-# Global dictionary to persist agents per token.
-persistent_agents = {}
+# Global dictionaries
+persistent_agents = {}       # Persist agents per token
+global_trade_stats = {}      # { token: { 'sum': total_outcome, 'count': total_trades } }
+global_trade_outcomes = {}   # Latest trade profit/loss outcomes
+global_held_trades = {}      # For currently active trades
+held_trades_lock = threading.Lock()  # Lock for active trade dictionary
 
-# ------------------------- Helper Function -------------------------
+# ------------------------- Helper Functions -------------------------
 def is_complete_token(entry):
     """Return True if the token entry has all required fields."""
     required_fields = [
@@ -59,6 +70,13 @@ def is_complete_token(entry):
     if "active" not in entry["boosts"]:
         return False
     return True
+
+def clear_console():
+    """Clears the console."""
+    if os.name == 'nt':
+        os.system('cls')
+    else:
+        os.system('clear')
 
 # ------------------------- Aggregation (Seeder) Code -------------------------
 class DataMining:
@@ -290,31 +308,25 @@ class GlobalKnowledge:
     def get_all(self):
         with self.lock:
             return self.data.copy()
+    def update_field(self, token, field, value):
+        with self.lock:
+            if token in self.data:
+                self.data[token][field] = value
 
 global_knowledge = GlobalKnowledge()
-global_trade_outcomes = {}  # Latest trade profit/loss outcomes
 
-def get_global_reinforcement_factor(predicted_action):
-    all_data = global_knowledge.get_all()
-    total_conf = 0.0
-    count = 0
-    for token, results in all_data.items():
-        votes = [results['rf']['action'], results['rl']['action'], results['xgb']['action']]
-        consensus = max(set(votes), key=votes.count)
-        if consensus == predicted_action:
-            conf_sum = 0.0
-            vote_count = 0
-            for agent in results.values():
-                if isinstance(agent, dict) and 'action' in agent and agent['action'] == predicted_action:
-                    conf_sum += agent['confidence']
-                    vote_count += 1
-            if vote_count > 0:
-                total_conf += (conf_sum / vote_count)
-                count += 1
-    return (total_conf / count) if count > 0 else 0
+# ------------------------- Trade Statistics -------------------------
+def update_trade_stats(token, outcome):
+    if token not in global_trade_stats:
+        global_trade_stats[token] = {'sum': 0.0, 'count': 0}
+    global_trade_stats[token]['sum'] += outcome
+    global_trade_stats[token]['count'] += 1
 
-global_held_trades = {}
-held_trades_lock = threading.Lock()
+def get_trade_ratio(token):
+    if token in global_trade_stats and global_trade_stats[token]['count'] > 0:
+        return global_trade_stats[token]['sum'] / global_trade_stats[token]['count']
+    else:
+        return 0
 
 # ------------------------- Configuration and Agent Classes -------------------------
 class TradingConfig:
@@ -322,19 +334,23 @@ class TradingConfig:
                  profit_threshold=0.01,
                  reward_value=0.05,
                  punishment_value=0.05,
+                 idle_duration=5,           # Duration to remain idle
                  bidding_duration=5,
                  holding_duration=10,
-                 positive_trade_multiplier_rate=0.1,
+                 positive_trade_multiplier_rate=0.15,
                  negative_trade_multiplier_rate=0.1,
-                 signal_refresh_interval=30):
+                 signal_refresh_interval=120,
+                 dashboard_refresh_interval=1):  # Dashboard refresh interval in seconds
         self.profit_threshold = profit_threshold
         self.reward_value = reward_value
         self.punishment_value = punishment_value
+        self.idle_duration = idle_duration
         self.bidding_duration = bidding_duration
         self.holding_duration = holding_duration
         self.positive_trade_multiplier_rate = positive_trade_multiplier_rate
         self.negative_trade_multiplier_rate = negative_trade_multiplier_rate
         self.signal_refresh_interval = signal_refresh_interval
+        self.dashboard_refresh_interval = dashboard_refresh_interval
 
 class TradingAgent:
     def __init__(self, config: TradingConfig):
@@ -359,24 +375,41 @@ class TradingAgent:
                 self.weight_score -= self.config.punishment_value * (1 - confidence) * punishment_multiplier
         self.weight_score = max(0.0, min(self.weight_score, 1.0))
 
+# --- All Agents include a global_bias parameter in predict and force string output ---
 class ReverseForestAgent(TradingAgent):
     def __init__(self, config: TradingConfig):
         super().__init__(config)
         self.model = RandomForestClassifier(n_estimators=100, random_state=42)
     def train(self, X: pd.DataFrame, y: pd.Series):
         self.model.fit(X, y)
-    def predict(self, sample: pd.DataFrame):
+    def predict(self, sample: pd.DataFrame, global_bias=0):
         pred_probs = self.model.predict_proba(sample)[0]
+        classes = list(self.model.classes_)
+        try:
+            buy_idx = classes.index('buy')
+            sell_idx = classes.index('sell')
+        except ValueError:
+            buy_idx = None
+            sell_idx = None
+        if global_bias != 0 and buy_idx is not None and sell_idx is not None:
+            bias_factor = 0.5
+            bias = global_bias * bias_factor
+            if bias > 0:
+                pred_probs[buy_idx] += bias
+                pred_probs[sell_idx] -= bias
+            else:
+                pred_probs[buy_idx] -= abs(bias)
+                pred_probs[sell_idx] += abs(bias)
         pred_idx = np.argmax(pred_probs)
-        action = self.model.classes_[pred_idx]
-        confidence = pred_probs[pred_idx]
+        action = str(classes[pred_idx])
+        confidence = pred_probs[pred_idx] / (np.sum(pred_probs) + 1e-6)
         return action, confidence
 
 class RLAgent(TradingAgent):
-    def __init__(self, config: TradingConfig, num_bins=10, actions=['buy', 'sell', 'hold']):
+    def __init__(self, config: TradingConfig, num_bins=10, actions=['idle', 'buy', 'sell', 'hold']):
         super().__init__(config)
         self.num_bins = num_bins
-        self.actions = actions
+        self.actions = actions  # Includes "idle"
         self.q_table = np.random.rand(num_bins, len(actions))
         self.alpha = 0.1
         self.gamma = 0.95
@@ -388,24 +421,34 @@ class RLAgent(TradingAgent):
             current_state = min(price_bins[i - 1], self.num_bins - 1)
             next_state = min(price_bins[i], self.num_bins - 1)
             if price_change_series.iloc[i] > self.config.profit_threshold:
-                reward_vector = [1, -1, 0]
+                reward_vector = [0, 1, -1, 0]
             elif price_change_series.iloc[i] < -self.config.profit_threshold:
-                reward_vector = [-1, 1, 0]
+                reward_vector = [0, -1, 1, 0]
             else:
-                reward_vector = [0, 0, 1]
+                reward_vector = [0, 0, 0, 1]
             action_idx = np.argmax(self.q_table[current_state])
             best_next_q = np.max(self.q_table[next_state])
             self.q_table[current_state, action_idx] += self.alpha * (
                 reward_vector[action_idx] + self.gamma * best_next_q - self.q_table[current_state, action_idx]
             )
-    def predict(self, current_price: float):
+    def predict(self, current_price: float, global_bias=0):
         if self.bins is None:
             raise ValueError("The agent must be trained before prediction.")
         state = np.digitize([current_price], self.bins) - 1
         state = min(state[0], self.num_bins - 1)
-        action_idx = np.argmax(self.q_table[state])
-        action = self.actions[action_idx]
-        confidence = self.q_table[state, action_idx] / (np.sum(self.q_table[state]) + 1e-6)
+        q_values = self.q_table[state].copy()
+        if global_bias != 0:
+            bias_factor = 0.5
+            bias = global_bias * bias_factor
+            if bias > 0:
+                q_values[1] += bias
+                q_values[2] -= bias
+            else:
+                q_values[1] -= abs(bias)
+                q_values[2] += abs(bias)
+        action_idx = np.argmax(q_values)
+        action = str(self.actions[action_idx])
+        confidence = q_values[action_idx] / (np.sum(q_values) + 1e-6)
         return action, confidence
 
 class XGBoostAgent(TradingAgent):
@@ -416,27 +459,45 @@ class XGBoostAgent(TradingAgent):
     def train(self, X: pd.DataFrame, y: pd.Series):
         y_encoded = self.le.fit_transform(y)
         self.model.fit(X, y_encoded)
-    def predict(self, sample: pd.DataFrame):
-        y_pred = self.model.predict(sample)
-        action = self.le.inverse_transform(y_pred)[0]
+    def predict(self, sample: pd.DataFrame, global_bias=0):
         pred_probs = self.model.predict_proba(sample)[0]
-        pred_idx = self.le.transform([action])[0]
-        confidence = pred_probs[pred_idx]
+        classes = list(self.model.classes_)
+        try:
+            buy_idx = classes.index('buy')
+            sell_idx = classes.index('sell')
+        except ValueError:
+            buy_idx = None
+            sell_idx = None
+        if global_bias != 0 and buy_idx is not None and sell_idx is not None:
+            bias_factor = 0.5
+            bias = global_bias * bias_factor
+            if bias > 0:
+                pred_probs[buy_idx] += bias
+                pred_probs[sell_idx] -= bias
+            else:
+                pred_probs[buy_idx] -= abs(bias)
+                pred_probs[sell_idx] += abs(bias)
+        pred_idx = np.argmax(pred_probs)
+        action = str(classes[pred_idx])
+        confidence = pred_probs[pred_idx] / (np.sum(pred_probs) + 1e-6)
         return action, confidence
 
 # ------------------------- Token Processing -------------------------
 def process_token(token_address: str, config: TradingConfig):
     """
-    Continuously processes a token (rebidding after each trading round).
+    Continuously processes a token.
     Uses persistent agent instances so that each token's agents learn over time.
+    Enforces an idle phase before bidding.
+    Updates trade statistics to compute a trade ratio, which scales a global bias.
+    All agents apply the same global bias method.
     """
     global persistent_agents
-    # Create persistent agents for this token if they don't exist.
     if token_address not in persistent_agents:
         persistent_agents[token_address] = {
             'rf': ReverseForestAgent(config),
             'rl': RLAgent(config, num_bins=10),
-            'xgb': XGBoostAgent(config)
+            'xgb': XGBoostAgent(config),
+            'global_value': 0
         }
     agents = persistent_agents[token_address]
 
@@ -483,30 +544,48 @@ def process_token(token_address: str, config: TradingConfig):
         latest_sample = X.iloc[[-1]]
         latest_price = latest_sample['priceusd'].values[0]
 
-        # Train persistent agents using current data.
+        # --- Idle Phase ---
+        idle_action = "idle"
+        instance_results = {
+            'rf': {'action': idle_action, 'confidence': 1.0, 'weight': agents['rf'].weight_score},
+            'rl': {'action': idle_action, 'confidence': 1.0, 'weight': agents['rl'].weight_score},
+            'xgb': {'action': idle_action, 'confidence': 1.0, 'weight': agents['xgb'].weight_score},
+            'token_symbol': df['basetoken_symbol'].iloc[0] if 'basetoken_symbol' in df.columns else token_address,
+            'global_value': agents.get('global_value', 0)
+        }
+        global_knowledge.update(token_address, instance_results)
+        time.sleep(config.idle_duration)
+
+        # --- Bidding Phase ---
         agents['rf'].train(X, y)
         agents['rl'].train(X['priceusd'], price_change)
         agents['xgb'].train(X, y)
 
-        rf_action, rf_confidence = agents['rf'].predict(latest_sample)
-        rl_action, rl_confidence = agents['rl'].predict(latest_price)
-        xgb_action, xgb_confidence = agents['xgb'].predict(latest_sample)
+        trade_ratio = get_trade_ratio(token_address)
+        global_value = agents.get('global_value', 0)
+        bias_factor = 0.5
+        global_bias = global_value * trade_ratio * bias_factor
+
+        rf_action, rf_confidence = agents['rf'].predict(latest_sample, global_bias=global_bias)
+        rl_action, rl_confidence = agents['rl'].predict(latest_price, global_bias=global_bias)
+        xgb_action, xgb_confidence = agents['xgb'].predict(latest_sample, global_bias=global_bias)
         token_symbol = df['basetoken_symbol'].iloc[0] if 'basetoken_symbol' in df.columns else token_address
 
-        # Update global knowledge BEFORE simulated trade.
         instance_results = {
             'rf': {'action': rf_action, 'confidence': rf_confidence, 'weight': agents['rf'].weight_score},
             'rl': {'action': rl_action, 'confidence': rl_confidence, 'weight': agents['rl'].weight_score},
             'xgb': {'action': xgb_action, 'confidence': xgb_confidence, 'weight': agents['xgb'].weight_score},
-            'token_symbol': token_symbol
+            'token_symbol': token_symbol,
+            'global_value': agents.get('global_value', 0)
         }
         global_knowledge.update(token_address, instance_results)
 
         if VERBOSE:
             print(f"[{token_symbol}] Recs: RF={rf_action}({rf_confidence:.2f}), RL={rl_action}({rl_confidence:.2f}), XGB={xgb_action}({xgb_confidence:.2f})")
-            consensus = max(set([rf_action, rl_action, xgb_action]), key=[rf_action, rl_action, xgb_action].count)
-            print(f"[{token_symbol}] Consensus: {consensus}")
+            consensus = max(set([rf_action, rl_action, xgb_action]), key=lambda x: str(x))
+            print(f"[{token_symbol}] Consensus: {str(consensus).upper()}")
             print(f"[{token_symbol}] Weights: RF={agents['rf'].weight_score:.2f}, RL={agents['rl'].weight_score:.2f}, XGB={agents['xgb'].weight_score:.2f}")
+            print(f"[{token_symbol}] Global Bias: {global_bias:.4f}")
             print(f"[{token_symbol}] Entering bidding phase for {config.bidding_duration} seconds.")
 
         time.sleep(config.bidding_duration)
@@ -527,6 +606,7 @@ def process_token(token_address: str, config: TradingConfig):
         if VERBOSE:
             print(f"[{token_symbol}] Trade closed. Profit: {simulated_profit*100:.2f}%")
         global_trade_outcomes[token_address] = simulated_profit
+        update_trade_stats(token_address, simulated_profit)
         if simulated_profit > config.profit_threshold:
             reward_multiplier = 1 + (config.holding_duration * config.positive_trade_multiplier_rate)
             punishment_multiplier = 1.0
@@ -534,17 +614,16 @@ def process_token(token_address: str, config: TradingConfig):
             reward_multiplier = 1.0
             punishment_multiplier = 1 + (config.holding_duration * config.negative_trade_multiplier_rate)
         
-        # Update agent rewards based on simulated trade outcome.
         agents['rf'].update_reward(rf_action, simulated_profit, rf_confidence, reward_multiplier, punishment_multiplier)
         agents['rl'].update_reward(rl_action, simulated_profit, rl_confidence, reward_multiplier, punishment_multiplier)
         agents['xgb'].update_reward(xgb_action, simulated_profit, xgb_confidence, reward_multiplier, punishment_multiplier)
         
-        # Update global knowledge AFTER reward adjustments.
         instance_results = {
             'rf': {'action': rf_action, 'confidence': rf_confidence, 'weight': agents['rf'].weight_score},
             'rl': {'action': rl_action, 'confidence': rl_confidence, 'weight': agents['rl'].weight_score},
             'xgb': {'action': xgb_action, 'confidence': xgb_confidence, 'weight': agents['xgb'].weight_score},
-            'token_symbol': token_symbol
+            'token_symbol': token_symbol,
+            'global_value': agents.get('global_value', 0)
         }
         global_knowledge.update(token_address, instance_results)
         
@@ -554,6 +633,7 @@ def process_token(token_address: str, config: TradingConfig):
 class Signal:
     def __init__(self, config: TradingConfig):
         self.config = config
+        self.command_queue = queue.Queue()
     def display_agent_weights(self):
         output = "\n------- Agent Weights -------\n"
         for token, results in global_knowledge.get_all().items():
@@ -561,7 +641,8 @@ class Signal:
             rf_w = results['rf']['weight']
             rl_w = results['rl']['weight']
             xgb_w = results['xgb']['weight']
-            output += f"Token: {token_symbol} | RF: {rf_w:.2f}, RL: {rl_w:.2f}, XGB: {xgb_w:.2f}\n"
+            global_val = results.get('global_value', 0)
+            output += f"Token: {token_symbol} | RF: {rf_w:.2f}, RL: {rl_w:.2f}, XGB: {xgb_w:.2f} | Global Value: {global_val:.4f}\n"
         output += "-----------------------------\n"
         return output
     def display_latest_signals(self):
@@ -569,18 +650,21 @@ class Signal:
         for token, results in global_knowledge.get_all().items():
             token_symbol = results.get('token_symbol', token)
             votes = [results['rf']['action'], results['rl']['action'], results['xgb']['action']]
-            consensus = max(set(votes), key=votes.count)
-            output += f"Token: {token_symbol} - Signal: {consensus.upper()}\n"
+            consensus = max(set(votes), key=lambda x: str(x))
+            output += f"Token: {token_symbol} - Signal: {str(consensus).upper()}\n"
         output += "------------------------\n"
         return output
     def display_trade_outcomes(self):
         output = "\n---- Latest Trade Outcomes ----\n"
-        if not global_trade_outcomes:
-            output += "No trade outcomes available.\n"
-        else:
-            for token, outcome in global_trade_outcomes.items():
-                token_symbol = global_knowledge.get_all().get(token, {}).get('token_symbol', token)
-                output += f"Token: {token_symbol} - Outcome: {outcome*100:.2f}%\n"
+        all_data = global_knowledge.get_all()
+        for token, info in all_data.items():
+            token_symbol = info.get('token_symbol', token)
+            outcome = global_trade_outcomes.get(token)
+            if outcome is None:
+                outcome_str = "N/A"
+            else:
+                outcome_str = f"{outcome*100:.2f}%"
+            output += f"Token: {token_symbol} - Outcome: {outcome_str}\n"
         output += "--------------------------------\n"
         return output
     def display_active_trades(self):
@@ -597,18 +681,40 @@ class Signal:
                     output += f"Token: {token_symbol} - Time Remaining: {remaining:.1f} seconds\n"
         output += "-------------------------------\n"
         return output
-    def run(self):
-        # Auto-refresh the dashboard every 'signal_refresh_interval' seconds.
+    def listen_for_input(self):
         while True:
-            sys.stdout.write("\033[2J\033[H")
+            cmd = input("Enter command (P for outcomes, C for active, Q to quit): ")
+            self.command_queue.put(cmd.strip().lower())
+    def run(self):
+        input_thread = threading.Thread(target=self.listen_for_input, daemon=True)
+        input_thread.start()
+        while True:
+            clear_console()  # Wipe the console completely before printing new output
             dashboard = ""
             dashboard += self.display_agent_weights()
             dashboard += self.display_latest_signals()
             dashboard += "\n---- Options ----\n"
-            dashboard += "Press Ctrl+C to quit.\n"
-            sys.stdout.write(dashboard)
-            sys.stdout.flush()
-            time.sleep(self.config.signal_refresh_interval)
+            dashboard += "P - Display latest trade outcomes\n"
+            dashboard += "C - Display current active trades\n"
+            dashboard += "Q - Quit\n"
+            dashboard += f"Dashboard auto-refreshes every {self.config.dashboard_refresh_interval} second(s).\n"
+            print(dashboard)  # Using print ensures a newline and clears the previous content.
+            try:
+                cmd = self.command_queue.get_nowait()
+                if cmd == 'p':
+                    clear_console()
+                    print(self.display_trade_outcomes())
+                    input("Press ENTER to return to dashboard...")
+                elif cmd == 'c':
+                    clear_console()
+                    print(self.display_active_trades())
+                    input("Press ENTER to return to dashboard...")
+                elif cmd == 'q':
+                    print("Exiting Signal interface.")
+                    break
+            except queue.Empty:
+                pass
+            time.sleep(self.config.dashboard_refresh_interval)
 
 # ------------------------- TokenLists Class -------------------------
 class TokenLists:
@@ -633,7 +739,6 @@ def final_database_check(required_rows=1, poll_interval=10):
 
 # ------------------------- Initialization Display -------------------------
 def display_initialization():
-    """Display a persistent progress bar until initialization is complete."""
     bar_length = 30
     while not init_complete:
         filled_length = int(round(bar_length * init_progress))
@@ -644,31 +749,87 @@ def display_initialization():
     sys.stdout.write("\nInitialization complete. Launching dashboard...\n")
     sys.stdout.flush()
 
+# ------------------------- Global Master (Centralized Critic) -------------------------
+class MasterCritic(nn.Module):
+    def __init__(self, input_size, hidden_size=32, output_size=1):
+        super(MasterCritic, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, output_size)
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        return x
+
+class GlobalMaster:
+    """
+    Aggregates global state from persistent agents,
+    trains a centralized critic to predict profit outcomes,
+    and broadcasts a global value estimate back to local agents.
+    """
+    def __init__(self, input_dim, hidden_dim=32, lr=0.001, update_interval=30):
+        self.critic = MasterCritic(input_dim, hidden_dim)
+        self.optimizer = optim.Adam(self.critic.parameters(), lr=lr)
+        self.update_interval = update_interval
+        self.running = False
+    def aggregate_global_state(self):
+        global_states = []
+        outcomes = []
+        tokens_list = []
+        data = global_knowledge.get_all()
+        for token, info in data.items():
+            tokens_list.append(token)
+            rf_weight = info['rf']['weight']
+            rl_weight = info['rl']['weight']
+            xgb_weight = info['xgb']['weight']
+            rf_conf = info['rf']['confidence']
+            rl_conf = info['rl']['confidence']
+            xgb_conf = info['xgb']['confidence']
+            avg_conf = (rf_conf + rl_conf + xgb_conf) / 3
+            state_vector = [rf_weight, rl_weight, xgb_weight, avg_conf]
+            global_states.append(state_vector)
+            outcome = global_trade_outcomes.get(token, 0)
+            outcomes.append([outcome])
+        if global_states:
+            state_tensor = torch.tensor(global_states, dtype=torch.float)
+            target_tensor = torch.tensor(outcomes, dtype=torch.float)
+            return state_tensor, target_tensor, tokens_list
+        else:
+            return None, None, None
+    def train_step(self):
+        state_tensor, target_tensor, tokens_list = self.aggregate_global_state()
+        if state_tensor is not None:
+            self.optimizer.zero_grad()
+            predictions = self.critic(state_tensor)
+            loss = nn.MSELoss()(predictions, target_tensor)
+            loss.backward()
+            self.optimizer.step()
+            print(f"Global Master Training Loss: {loss.item():.4f}")
+            for token, pred in zip(tokens_list, predictions):
+                global_knowledge.update_field(token, 'global_value', pred.item())
+                if token in persistent_agents:
+                    persistent_agents[token]['global_value'] = pred.item()
+        else:
+            print("Global Master: No global states to train on.")
+    def run(self):
+        self.running = True
+        while self.running:
+            self.train_step()
+            time.sleep(self.update_interval)
+    def stop(self):
+        self.running = False
+
 # ------------------------- Telegram Bot Class -------------------------
 class TelegramBot:
     def __init__(self, token, chat_id, global_knowledge, poll_interval=30):
-        """
-        Initializes the Telegram bot.
-
-        Parameters:
-            token (str): The Telegram bot token.
-            chat_id (str or int): The Telegram group chat ID where messages will be sent.
-            global_knowledge (GlobalKnowledge): A reference to the global knowledge instance containing agent signals.
-            poll_interval (int, optional): How often (in seconds) to send updates.
-        """
         self.token = token
         self.chat_id = chat_id
         self.global_knowledge = global_knowledge
         self.poll_interval = poll_interval
         self.bot = Bot(token=self.token)
         self.running = False
-
     def construct_message(self):
-        """
-        Constructs the message text to send to the Telegram group chat based on the latest agent signals.
-        Returns:
-            str: A formatted message string.
-        """
         data = self.global_knowledge.get_all()
         if not data:
             return "No agent signals available."
@@ -680,15 +841,11 @@ class TelegramBot:
                 info["rl"]["action"],
                 info["xgb"]["action"]
             ]
-            consensus = max(set(votes), key=votes.count)
-            message_lines.append(f"Token: {token_symbol} -> Consensus: {consensus.upper()}")
+            consensus = max(set(votes), key=lambda x: str(x))
+            global_val = info.get("global_value", 0)
+            message_lines.append(f"Token: {token_symbol} -> Consensus: {str(consensus).upper()} | Global Value: {global_val:.4f}")
         return "\n".join(message_lines)
-
     def relay_signals(self):
-        """
-        Periodically sends the constructed signal message to the specified Telegram group chat.
-        This method creates its own event loop to await the asynchronous send_message call.
-        """
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         while self.running:
@@ -698,19 +855,11 @@ class TelegramBot:
             except TelegramError as e:
                 print(f"Error sending message: {e}")
             time.sleep(self.poll_interval)
-
     def start(self):
-        """
-        Starts the Telegram bot's signal relay in a separate daemon thread.
-        """
         self.running = True
         self.thread = threading.Thread(target=self.relay_signals, daemon=True)
         self.thread.start()
-
     def stop(self):
-        """
-        Stops the signal relay and waits for the thread to finish.
-        """
         self.running = False
         if hasattr(self, 'thread') and self.thread.is_alive():
             self.thread.join()
@@ -729,11 +878,13 @@ def main():
         profit_threshold=0.01,
         reward_value=0.05,
         punishment_value=0.05,
+        idle_duration=5,
         bidding_duration=5,
         holding_duration=60,
         positive_trade_multiplier_rate=0.1,
         negative_trade_multiplier_rate=0.1,
-        signal_refresh_interval=30
+        signal_refresh_interval=30,
+        dashboard_refresh_interval=1
     )
     
     token_lists = TokenLists(
@@ -743,7 +894,7 @@ def main():
     latest = [entry["tokenAddress"] for entry in token_lists.latest_boosted_token_addresses]
     most_active = [entry["tokenAddress"] for entry in token_lists.most_active_boosted_token_addresses]
     all_tokens = list(set(latest + most_active))
-    all_tokens = all_tokens[:20]  # Limit to 20 tokens
+    all_tokens = all_tokens[:20]
     
     print("Starting processing for tokens")
     
@@ -751,13 +902,15 @@ def main():
     for token in all_tokens:
         executor.submit(process_token, token, config)
     
-    # Instantiate and start the Telegram bot BEFORE launching the Signal dashboard.
     TELEGRAM_BOT_TOKEN = "7937809727:AAF84eC3iKCwhYvbFeaU-TJTp3H6RQqr45Y"
-    TELEGRAM_CHAT_ID = "-1002338904119"  # Make sure this is the correct chat ID.
+    TELEGRAM_CHAT_ID = "-1002338904119"
     telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, global_knowledge, poll_interval=30)
     telegram_bot.start()
     
-    # Now launch the Signal dashboard (this call is blocking).
+    global_master = GlobalMaster(input_dim=4, hidden_dim=32, lr=0.001, update_interval=30)
+    master_thread = threading.Thread(target=global_master.run, daemon=True)
+    master_thread.start()
+    
     signal = Signal(config)
     signal.run()
 
